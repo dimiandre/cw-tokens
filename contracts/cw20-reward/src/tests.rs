@@ -1,28 +1,7 @@
-//! This integration test tries to run and call the generated wasm.
-//! It depends on a Wasm build being available, which you can create with `cargo wasm`.
-//! Then running `cargo integration-test` will validate we can properly call into that generated Wasm.
-//!
-//! You can easily convert unit tests to integration tests as follows:
-//! 1. Copy them over verbatim
-//! 2. Then change
-//!      let mut deps = mock_dependencies(20, &[]);
-//!    to
-//!      let mut deps = mock_instance(WASM, &[]);
-//! 3. If you access raw storage, where ever you see something like:
-//!      deps.storage.get(CONFIG_KEY).expect("no data stored");
-//!    replace it with:
-//!      deps.with_storage(|store| {
-//!          let data = store.get(CONFIG_KEY).expect("no data stored");
-//!          //...
-//!      });
-//! 4. Anywhere you see query(&deps, ...) you must replace it with query(&mut deps, ...)
-
 #[cfg(test)]
 mod tests {
     use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
-    use cosmwasm_std::{
-        from_binary, to_binary, Addr, BankMsg, Coin, Decimal, MessageInfo, SubMsg, Uint128, WasmMsg,
-    };
+    use cosmwasm_std::{from_binary, to_binary, Addr, BankMsg, Coin, Decimal, MessageInfo, SubMsg, Uint128, WasmMsg, Empty};
 
     use crate::contract::{calculate_decimal_rewards, execute, get_decimals, instantiate, query};
     use crate::msg::{
@@ -37,6 +16,95 @@ mod tests {
     use std::borrow::BorrowMut;
     use std::ops::{Mul, Sub};
     use std::str::FromStr;
+    use cw_multi_test::{App, Contract, ContractWrapper};
+
+    #[derive(Derivative)]
+    #[derivative(Debug)]
+    pub struct Suite {
+        /// Application mock
+        #[derivative(Debug = "ignore")]
+        app: App,
+        /// ID of stored code for cw20 contract
+        cw20_id: u64,
+    }
+
+    impl Suite {
+        pub fn init() -> Result<Suite> {
+            let mut app = mock_app();
+            let owner = "owner".to_owned();
+            let cw1_id = app.store_code(contract_cw1());
+
+            Ok(Suite { app, owner, cw1_id })
+        }
+
+        pub fn instantiate_cw1_contract(&mut self, admins: Vec<String>, mutable: bool) -> Cw1Contract {
+            let contract = self
+                .app
+                .instantiate_contract(
+                    self.cw1_id,
+                    Addr::unchecked(self.owner.clone()),
+                    &InstantiateMsg { admins, mutable },
+                    &[],
+                    "Whitelist",
+                    None,
+                )
+                .unwrap();
+            Cw1Contract(contract)
+        }
+
+        pub fn execute<M>(
+            &mut self,
+            sender_contract: Addr,
+            target_contract: &Addr,
+            msg: M,
+        ) -> Result<AppResponse>
+            where
+                M: Serialize + DeserializeOwned,
+        {
+            let execute: ExecuteMsg = ExecuteMsg::Execute {
+                msgs: vec![CosmosMsg::Wasm(WasmMsg::Execute {
+                    contract_addr: target_contract.to_string(),
+                    msg: to_binary(&msg)?,
+                    funds: vec![],
+                })],
+            };
+            self.app
+                .execute_contract(
+                    Addr::unchecked(self.owner.clone()),
+                    sender_contract,
+                    &execute,
+                    &[],
+                )
+                .map_err(|err| anyhow!(err))
+        }
+
+        pub fn query<M>(&self, target_contract: Addr, msg: M) -> Result<AdminListResponse, StdError>
+            where
+                M: Serialize + DeserializeOwned,
+        {
+            self.app.wrap().query(&QueryRequest::Wasm(WasmQuery::Smart {
+                contract_addr: target_contract.to_string(),
+                msg: to_binary(&msg).unwrap(),
+            }))
+        }
+    }
+    fn mock_app() -> App {
+        App::default()
+    }
+
+    pub fn contract_cw20_reward() -> Box<dyn Contract<Empty>> {
+        let contract = ContractWrapper::new(execute, instantiate, query);
+        Box::new(contract)
+    }
+
+    pub fn contract_cw20() -> Box<dyn Contract<Empty>> {
+        let contract = ContractWrapper::new(
+            cw20_base::contract::execute,
+            cw20_base::contract::instantiate,
+            cw20_base::contract::query,
+        );
+        Box::new(contract)
+    }
 
     const MOCK_CW20_CONTRACT_ADDR: &str = "cw20";
     fn default_init() -> InstantiateMsg {
@@ -356,6 +424,7 @@ mod tests {
 
     #[test]
     fn claim_rewards() {
+
         let mut deps = mock_dependencies(&[]);
 
         let init_msg = default_init();
